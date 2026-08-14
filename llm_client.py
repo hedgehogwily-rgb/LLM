@@ -4,23 +4,18 @@ import os
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from prompts import build_prompt
+from prompts import DEFAULT_VARIANT, build_user_prompt, get_system_prompt
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
-def generate_summary(text: str) -> dict:
-    prompt = build_prompt(text)
-
+def generate_summary(text: str, variant: str = DEFAULT_VARIANT) -> dict:
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful assistant that can summarize and analyze text. Always reply with valid JSON only. All text values must be in the same language as the input text.",
-            },
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": get_system_prompt(variant)},
+            {"role": "user", "content": build_user_prompt(text, variant)},
         ],
         temperature=0.5,
         max_tokens=1500,
