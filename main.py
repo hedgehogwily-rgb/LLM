@@ -1,16 +1,11 @@
 import json
 import logging
-import re
+from collections import Counter, defaultdict
 from pathlib import Path
 
-from llm_client import generate_summary
-from prompts import (
-    DEFAULT_VARIANT,
-    HELPFUL_RESPONSE_MAX_SENTENCES,
-    KEY_POINTS_COUNT,
-    PROMPT_VARIANTS,
-    SUMMARY_MAX_WORDS,
-)
+from llm_client import StructuredOutputError, generate_summary
+from prompts import DEFAULT_VARIANT
+from schemas import AnalysisResult
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,136 +23,91 @@ def load_texts(directory: Path = TEXTS_DIR) -> list[tuple[str, str]]:
     return [(path.name, path.read_text(encoding="utf-8").strip()) for path in paths]
 
 
-def count_words(text: str) -> int:
-    return len(re.findall(r"\w+", text, flags=re.UNICODE))
-
-
-def count_sentences(text: str) -> int:
-    parts = [p for p in re.split(r"[.!?…]+", text.strip()) if p.strip()]
-    return max(len(parts), 1) if text.strip() else 0
-
-
-def evaluate_result(result: dict) -> dict:
-    summary = result.get("summary", "")
-    key_points = result.get("key_points", [])
-    helpful = result.get("helpful_response", "")
-
-    summary_words = count_words(summary)
-    helpful_sentences = count_sentences(helpful)
-    points_ok = isinstance(key_points, list) and len(key_points) == KEY_POINTS_COUNT
-    summary_ok = summary_words <= SUMMARY_MAX_WORDS
-    helpful_ok = helpful_sentences <= HELPFUL_RESPONSE_MAX_SENTENCES
-
-    checks = {
-        "summary_words": summary_words,
-        "summary_ok": summary_ok,
-        "key_points_count": len(key_points) if isinstance(key_points, list) else 0,
-        "key_points_ok": points_ok,
-        "helpful_sentences": helpful_sentences,
-        "helpful_ok": helpful_ok,
-    }
-    checks["score"] = int(summary_ok) + int(points_ok) + int(helpful_ok)
-    return checks
-
-
-def log_result(index: int, filename: str, variant: str, text: str, result: dict, checks: dict) -> None:
+def log_result(index: int, filename: str, result: AnalysisResult) -> None:
     logger.info("=" * 60)
-    logger.info("Текст #%s (%s) | variant=%s | score=%s/3", index, filename, variant, checks["score"])
-    logger.info("Summary (%s words): %s", checks["summary_words"], result.get("summary", ""))
-    logger.info("Key points (%s):", checks["key_points_count"])
-    for i, point in enumerate(result.get("key_points", []), start=1):
+    logger.info("Текст #%s (%s)", index, filename)
+    logger.info("Category: %s | Sentiment: %s", result.category, result.sentiment.value)
+    logger.info("Summary: %s", result.summary)
+    logger.info("Key points:")
+    for i, point in enumerate(result.key_points, start=1):
         logger.info("  %s. %s", i, point)
-    logger.info("Helpful response: %s", result.get("helpful_response", ""))
+    logger.info("Final answer: %s", result.final_answer)
 
 
-def compare_variants(texts: list[tuple[str, str]]) -> dict:
-    comparison = {"variants": {}, "totals": {}}
+def build_report(rows: list[tuple[str, AnalysisResult]]) -> dict:
+    """Используем поля schema: группировка, тональность, ответы по категориям."""
+    by_category: dict[str, list[str]] = defaultdict(list)
+    sentiments: Counter[str] = Counter()
+    answers_by_category: dict[str, list[str]] = defaultdict(list)
 
-    for variant in PROMPT_VARIANTS:
-        variant_rows = []
-        total_score = 0
-        for i, (filename, text) in enumerate(texts, start=1):
-            result = generate_summary(text, variant=variant)
-            checks = evaluate_result(result)
-            total_score += checks["score"]
-            log_result(i, filename, variant, text, result, checks)
-            variant_rows.append(
-                {
-                    "file": filename,
-                    "text": text,
-                    "result": result,
-                    "checks": checks,
-                }
-            )
-        comparison["variants"][variant] = variant_rows
-        comparison["totals"][variant] = {
-            "score_sum": total_score,
-            "max_score": len(texts) * 3,
-            "avg_score": round(total_score / (len(texts) * 3), 3) if texts else 0.0,
-        }
-        logger.info(
-            "Итог %s: %s/%s",
-            variant,
-            total_score,
-            len(texts) * 3,
-        )
+    for filename, result in rows:
+        by_category[result.category].append(filename)
+        sentiments[result.sentiment.value] += 1
+        answers_by_category[result.category].append(result.final_answer)
 
-    # При равном score предпочитаем DEFAULT_VARIANT (более структурированный промпт).
-    best_variant = max(
-        comparison["totals"],
-        key=lambda name: (
-            comparison["totals"][name]["score_sum"],
-            1 if name == DEFAULT_VARIANT else 0,
-        ),
-    )
-    comparison["best_variant"] = best_variant
-    comparison["default_variant"] = DEFAULT_VARIANT
-    return comparison
+    positive_files = [
+        filename for filename, result in rows if result.sentiment.value == "positive"
+    ]
 
-
-def run_best(texts: list[tuple[str, str]], variant: str) -> list[dict]:
-    results = []
-    for i, (filename, text) in enumerate(texts, start=1):
-        result = generate_summary(text, variant=variant)
-        checks = evaluate_result(result)
-        log_result(i, filename, variant, text, result, checks)
-        results.append(
-            {
-                "file": filename,
-                "text": text,
-                "variant": variant,
-                "result": result,
-                "checks": checks,
-            }
-        )
-    return results
+    return {
+        "total": len(rows),
+        "by_category": dict(by_category),
+        "sentiment_counts": dict(sentiments),
+        "positive_files": positive_files,
+        "answers_by_category": dict(answers_by_category),
+    }
 
 
 def main() -> None:
     texts = load_texts()
-    if len(texts) < 3:
-        raise ValueError("Нужно минимум 3 тестовых текста в папке texts/")
+    if len(texts) < 5:
+        raise ValueError("Нужно минимум 5 тестовых текстов в папке texts/")
 
-    logger.info("Сравниваем варианты промптов: %s", ", ".join(PROMPT_VARIANTS))
-    comparison = compare_variants(texts)
+    results: list[dict] = []
+    parsed_rows: list[tuple[str, AnalysisResult]] = []
+    errors: list[dict] = []
 
-    comparison_path = Path("comparison.json")
-    comparison_path.write_text(
-        json.dumps(comparison, ensure_ascii=False, indent=2),
+    for i, (filename, text) in enumerate(texts, start=1):
+        try:
+            result = generate_summary(text, variant=DEFAULT_VARIANT)
+            log_result(i, filename, result)
+            parsed_rows.append((filename, result))
+            results.append(
+                {
+                    "file": filename,
+                    "text": text,
+                    "variant": DEFAULT_VARIANT,
+                    "result": result.model_dump(mode="json"),
+                }
+            )
+        except StructuredOutputError as exc:
+            logger.error("Ошибка structured output для %s: %s", filename, exc)
+            errors.append({"file": filename, "error": str(exc)})
+
+    report = build_report(parsed_rows)
+
+    logger.info("=" * 60)
+    logger.info("Отчёт по structured fields")
+    logger.info("Всего успешно: %s | ошибок: %s", report["total"], len(errors))
+    logger.info("По категориям: %s", report["by_category"])
+    logger.info("Тональность: %s", report["sentiment_counts"])
+    logger.info("Позитивные тексты: %s", report["positive_files"])
+    for category, answers in report["answers_by_category"].items():
+        logger.info("Final answers [%s]: %s", category, answers)
+
+    output_path = Path("results.json")
+    output_path.write_text(
+        json.dumps(
+            {"results": results, "errors": errors, "report": report},
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
-    logger.info("Сравнение сохранено в %s", comparison_path)
+    logger.info("Результаты сохранены в %s", output_path)
 
-    best_variant = comparison["best_variant"]
-    logger.info("Лучший по метрикам: %s", best_variant)
-
-    final_results = run_best(texts, variant=best_variant)
-    results_path = Path("results.json")
-    results_path.write_text(
-        json.dumps(final_results, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    logger.info("Финальные результаты (%s) сохранены в %s", best_variant, results_path)
+    if errors and not results:
+        raise SystemExit("Все примеры завершились ошибкой валидации JSON.")
 
 
 if __name__ == "__main__":
