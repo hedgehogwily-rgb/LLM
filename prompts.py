@@ -1,85 +1,96 @@
-"""Промпты отделены от пайплайна: system + user template + варианты формулировок."""
+from schemas import RequestType
 
-SUMMARY_MAX_WORDS = 25
 KEY_POINTS_COUNT = 3
-FINAL_ANSWER_MAX_SENTENCES = 2
+REQUEST_TYPES = " | ".join(item.value for item in RequestType)
 
-CATEGORIES = "tech | health | education | lifestyle | other"
-SENTIMENTS = "positive | neutral | negative"
+CLASSIFY_SYSTEM_PROMPT = (
+    "You are a request classifier for a customer-facing assistant. "
+    "Reply with valid JSON only and no markdown. "
+    "Pick exactly one category from the allowed enum. "
+    "intent must be a short phrase in the same language as the input text. "
+    "confidence is a float from 0 to 1."
+)
 
-SYSTEM_PROMPTS = {
-    "v1_basic": (
-        "You are a helpful assistant. "
-        "Reply with valid JSON only. "
-        "Use the same language as the input text for summary, key_points and final_answer. "
-        "category and sentiment must be English enum values."
-    ),
-    "v2_strict": (
-        "You are a careful text analyst. "
-        "Always reply with valid JSON only. "
-        "Follow length and enum limits strictly. "
-        "Use the same language as the input text for text fields. "
-        "Do not add extra fields."
-    ),
-    "v3_structured": (
-        "You are a precise text analyst. "
-        "Always reply with valid JSON only and no markdown. "
-        "Obey all constraints and enums exactly. "
-        "Use the same language as the input text for summary, key_points and final_answer. "
-        "Prefer clarity and concrete wording over vague statements."
-    ),
-}
+CLASSIFY_USER_TEMPLATE = (
+    "Classify the user request and return ONLY this JSON schema:\n"
+    "{{\n"
+    f'  "category": "{REQUEST_TYPES}",\n'
+    '  "intent": string,\n'
+    '  "confidence": number\n'
+    "}}\n\n"
+    "Category meanings:\n"
+    "- support: technical help, bugs, access issues\n"
+    "- feedback: praise or constructive product feedback\n"
+    "- complaint: dissatisfaction, anger, service failure\n"
+    "- sales: buying, pricing, plans, upgrades\n"
+    "- general_question: informational question without clear sales/support intent\n\n"
+    "Text:\n{text}"
+)
 
-USER_TEMPLATES = {
-    "v1_basic": (
-        "Analyze the text and return JSON with fields:\n"
-        '- "summary": short summary\n'
-        f'- "category": one of [{CATEGORIES}]\n'
-        f'- "sentiment": one of [{SENTIMENTS}]\n'
-        '- "key_points": array of key points\n'
-        '- "final_answer": short helpful response\n\n'
-        "Text:\n{text}"
+RESPONSE_SYSTEM_BASE = (
+    "You are a helpful assistant. "
+    "Always reply with valid JSON only and no markdown. "
+    "Use the same language as the input text for summary, key_points and final_answer. "
+    "Do not add extra fields."
+)
+
+# Явные инструкции по стилю ответа — выбираются роутером в коде.
+RESPONSE_PROMPTS: dict[RequestType, str] = {
+    RequestType.complaint: (
+        "Style: empathetic complaint handling. "
+        "Acknowledge the problem, apologize briefly, stay calm, and propose one concrete next step. "
+        "Do not sound defensive or salesy."
     ),
-    "v2_strict": (
-        "Return JSON with exactly these fields:\n"
-        f'- "summary": max {SUMMARY_MAX_WORDS} words\n'
-        f'- "category": one of [{CATEGORIES}]\n'
-        f'- "sentiment": one of [{SENTIMENTS}]\n'
-        f'- "key_points": exactly {KEY_POINTS_COUNT} short ideas\n'
-        f'- "final_answer": at most {FINAL_ANSWER_MAX_SENTENCES} sentences\n\n'
-        "Do not exceed these limits.\n\n"
-        "Text:\n{text}"
+    RequestType.sales: (
+        "Style: short sales response. "
+        "Highlight value clearly, keep it concise, and end with a clear call to action."
     ),
-    "v3_structured": (
-        "Task: analyze the text and return ONLY this JSON schema:\n"
-        "{{\n"
-        '  "summary": string,\n'
-        f'  "category": "{CATEGORIES}",\n'
-        f'  "sentiment": "{SENTIMENTS}",\n'
-        '  "key_points": [string, string, string],\n'
-        '  "final_answer": string\n'
-        "}}\n\n"
-        "Constraints:\n"
-        f"1) summary <= {SUMMARY_MAX_WORDS} words\n"
-        f"2) key_points length must be exactly {KEY_POINTS_COUNT}\n"
-        f"3) final_answer <= {FINAL_ANSWER_MAX_SENTENCES} short sentences\n"
-        "4) no extra keys, no markdown, no commentary\n"
-        "5) each key point must be specific and non-overlapping\n\n"
-        "Text:\n{text}"
+    RequestType.support: (
+        "Style: structured technical support. "
+        "Give a clear numbered troubleshooting path (2–3 steps) and ask for missing diagnostic details if needed."
+    ),
+    RequestType.feedback: (
+        "Style: grateful feedback handling. "
+        "Thank the user, reflect the key point, and say what you will take into account."
+    ),
+    RequestType.general_question: (
+        "Style: clear informative answer. "
+        "Answer directly, stay neutral, and avoid sales pressure."
     ),
 }
 
-DEFAULT_VARIANT = "v3_structured"
-PROMPT_VARIANTS = tuple(SYSTEM_PROMPTS.keys())
+RESPONSE_USER_TEMPLATE = (
+    "Category: {category}\n"
+    "Intent: {intent}\n"
+    "Style instructions:\n{style_instructions}\n\n"
+    "Return ONLY this JSON schema:\n"
+    "{{\n"
+    '  "summary": string,\n'
+    '  "key_points": [string, string, string],\n'
+    '  "final_answer": string\n'
+    "}}\n\n"
+    f"Constraints:\n"
+    f"1) key_points length must be exactly {KEY_POINTS_COUNT}\n"
+    "2) summary is short\n"
+    "3) final_answer must clearly follow the style instructions\n"
+    "4) no extra keys, no markdown\n\n"
+    "Text:\n{text}"
+)
 
 
-def get_system_prompt(variant: str = DEFAULT_VARIANT) -> str:
-    if variant not in SYSTEM_PROMPTS:
-        raise ValueError(f"Unknown prompt variant: {variant}. Available: {PROMPT_VARIANTS}")
-    return SYSTEM_PROMPTS[variant]
+def build_classify_user_prompt(text: str) -> str:
+    return CLASSIFY_USER_TEMPLATE.format(text=text)
 
 
-def build_user_prompt(text: str, variant: str = DEFAULT_VARIANT) -> str:
-    if variant not in USER_TEMPLATES:
-        raise ValueError(f"Unknown prompt variant: {variant}. Available: {PROMPT_VARIANTS}")
-    return USER_TEMPLATES[variant].format(text=text)
+def build_response_user_prompt(
+    text: str,
+    category: RequestType,
+    intent: str,
+    style_instructions: str,
+) -> str:
+    return RESPONSE_USER_TEMPLATE.format(
+        text=text,
+        category=category.value,
+        intent=intent,
+        style_instructions=style_instructions,
+    )

@@ -1,11 +1,11 @@
 import json
 import logging
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from llm_client import StructuredOutputError, generate_summary
-from prompts import DEFAULT_VARIANT
-from schemas import AnalysisResult
+from llm_client import StructuredOutputError, classify, generate_routed_answer
+from schemas import RequestType, RoutedAnswer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,19 +14,46 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TEXTS_DIR = Path("texts")
+EXPECTED_PATTERN = re.compile(
+    r"^(?P<label>support|feedback|complaint|sales|general)_.+\.txt$"
+)
+
+
+def expected_category_from_filename(filename: str) -> str | None:
+    match = EXPECTED_PATTERN.match(filename)
+    if not match:
+        return None
+    label = match.group("label")
+    return "general_question" if label == "general" else label
 
 
 def load_texts(directory: Path = TEXTS_DIR) -> list[tuple[str, str]]:
-    paths = sorted(directory.glob("text*.txt"))
+    paths = sorted(directory.glob("*.txt"))
     if not paths:
-        raise FileNotFoundError(f"Нет файлов text*.txt в {directory}")
+        raise FileNotFoundError(f"Нет .txt файлов в {directory}")
     return [(path.name, path.read_text(encoding="utf-8").strip()) for path in paths]
 
 
-def log_result(index: int, filename: str, result: AnalysisResult) -> None:
+def log_result(
+    index: int,
+    filename: str,
+    expected: str | None,
+    result: RoutedAnswer,
+    confidence: float,
+) -> None:
+    match_mark = ""
+    if expected:
+        match_mark = " OK" if expected == result.category.value else " MISS"
     logger.info("=" * 60)
-    logger.info("Текст #%s (%s)", index, filename)
-    logger.info("Category: %s | Sentiment: %s", result.category, result.sentiment.value)
+    logger.info("Текст #%s (%s)%s", index, filename, match_mark)
+    logger.info(
+        "expected=%s | predicted=%s | prompt_used=%s | confidence=%.2f",
+        expected,
+        result.category.value,
+        result.prompt_used,
+        confidence,
+    )
+    logger.info("Intent: %s", result.intent)
     logger.info("Summary: %s", result.summary)
     logger.info("Key points:")
     for i, point in enumerate(result.key_points, start=1):
@@ -34,71 +61,114 @@ def log_result(index: int, filename: str, result: AnalysisResult) -> None:
     logger.info("Final answer: %s", result.final_answer)
 
 
-def build_report(rows: list[tuple[str, AnalysisResult]]) -> dict:
-    """Используем поля schema: группировка, тональность, ответы по категориям."""
+def build_report(rows: list[dict]) -> dict:
     by_category: dict[str, list[str]] = defaultdict(list)
-    sentiments: Counter[str] = Counter()
-    answers_by_category: dict[str, list[str]] = defaultdict(list)
+    prompt_usage: Counter[str] = Counter()
+    correct = 0
+    labeled = 0
 
-    for filename, result in rows:
-        by_category[result.category].append(filename)
-        sentiments[result.sentiment.value] += 1
-        answers_by_category[result.category].append(result.final_answer)
-
-    positive_files = [
-        filename for filename, result in rows if result.sentiment.value == "positive"
-    ]
+    for row in rows:
+        category = row["result"]["category"]
+        by_category[category].append(row["file"])
+        prompt_usage[row["result"]["prompt_used"]] += 1
+        expected = row.get("expected_category")
+        if expected:
+            labeled += 1
+            if expected == category:
+                correct += 1
 
     return {
         "total": len(rows),
         "by_category": dict(by_category),
-        "sentiment_counts": dict(sentiments),
-        "positive_files": positive_files,
-        "answers_by_category": dict(answers_by_category),
+        "prompt_usage": dict(prompt_usage),
+        "classification_accuracy": {
+            "labeled": labeled,
+            "correct": correct,
+            "accuracy": round(correct / labeled, 3) if labeled else None,
+        },
+        "routing_proof": [
+            {
+                "file": row["file"],
+                "category": row["result"]["category"],
+                "prompt_used": row["result"]["prompt_used"],
+                "final_answer": row["result"]["final_answer"],
+            }
+            for row in rows
+        ],
     }
+
+
+def run_routing_smoke_check(sample_text: str) -> list[dict]:
+    classification = classify(sample_text)
+    demos = []
+    for forced in (RequestType.complaint, RequestType.sales, RequestType.support):
+        answer = generate_routed_answer(sample_text, classification, category=forced)
+        demos.append(
+            {
+                "forced_category": forced.value,
+                "prompt_used": answer.prompt_used,
+                "final_answer": answer.final_answer,
+            }
+        )
+        logger.info(
+            "Smoke | forced=%s | prompt=%s | answer=%s",
+            forced.value,
+            answer.prompt_used,
+            answer.final_answer,
+        )
+    return demos
 
 
 def main() -> None:
     texts = load_texts()
-    if len(texts) < 5:
-        raise ValueError("Нужно минимум 5 тестовых текстов в папке texts/")
+    if len(texts) < 8:
+        raise ValueError("Нужно минимум 8 тестовых текстов в папке texts/")
 
     results: list[dict] = []
-    parsed_rows: list[tuple[str, AnalysisResult]] = []
     errors: list[dict] = []
 
     for i, (filename, text) in enumerate(texts, start=1):
+        expected = expected_category_from_filename(filename)
         try:
-            result = generate_summary(text, variant=DEFAULT_VARIANT)
-            log_result(i, filename, result)
-            parsed_rows.append((filename, result))
+            classification = classify(text)
+            answer = generate_routed_answer(text, classification)
+            log_result(i, filename, expected, answer, classification.confidence)
             results.append(
                 {
                     "file": filename,
                     "text": text,
-                    "variant": DEFAULT_VARIANT,
-                    "result": result.model_dump(mode="json"),
+                    "expected_category": expected,
+                    "classification": classification.model_dump(mode="json"),
+                    "result": answer.model_dump(mode="json"),
                 }
             )
         except StructuredOutputError as exc:
             logger.error("Ошибка structured output для %s: %s", filename, exc)
             errors.append({"file": filename, "error": str(exc)})
 
-    report = build_report(parsed_rows)
-
+    report = build_report(results)
     logger.info("=" * 60)
-    logger.info("Отчёт по structured fields")
-    logger.info("Всего успешно: %s | ошибок: %s", report["total"], len(errors))
+    logger.info("Отчёт routing")
+    logger.info("Успешно: %s | ошибок: %s", report["total"], len(errors))
     logger.info("По категориям: %s", report["by_category"])
-    logger.info("Тональность: %s", report["sentiment_counts"])
-    logger.info("Позитивные тексты: %s", report["positive_files"])
-    for category, answers in report["answers_by_category"].items():
-        logger.info("Final answers [%s]: %s", category, answers)
+    logger.info("Использование промптов: %s", report["prompt_usage"])
+    logger.info("Accuracy классификации: %s", report["classification_accuracy"])
+
+    smoke = []
+    if results:
+        logger.info("=" * 60)
+        logger.info("Smoke-check: один текст, разные forced categories")
+        smoke = run_routing_smoke_check(results[0]["text"])
 
     output_path = Path("results.json")
     output_path.write_text(
         json.dumps(
-            {"results": results, "errors": errors, "report": report},
+            {
+                "results": results,
+                "errors": errors,
+                "report": report,
+                "routing_smoke_check": smoke,
+            },
             ensure_ascii=False,
             indent=2,
         ),

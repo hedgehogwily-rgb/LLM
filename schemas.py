@@ -1,28 +1,39 @@
 from enum import Enum
-from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 
-class Sentiment(str, Enum):
-    positive = "positive"
-    neutral = "neutral"
-    negative = "negative"
+class RequestType(str, Enum):
+    support = "support"
+    feedback = "feedback"
+    complaint = "complaint"
+    sales = "sales"
+    general_question = "general_question"
 
 
-Category = Literal["tech", "health", "education", "lifestyle", "other"]
+class ClassificationResult(BaseModel):
+    category: RequestType
+    intent: str = Field(..., min_length=1, description="Краткое описание намерения пользователя")
+    confidence: float = Field(..., ge=0.0, le=1.0)
+
+    @field_validator("intent")
+    @classmethod
+    def strip_intent(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("intent не должен быть пустым")
+        return value
 
 
-class AnalysisResult(BaseModel):
-    """Структурированный ответ модели после валидации."""
-
-    summary: str = Field(..., min_length=1, description="Краткое резюме текста")
-    category: Category
-    sentiment: Sentiment
+class RoutedAnswer(BaseModel):
+    category: RequestType
+    intent: str = Field(..., min_length=1)
+    summary: str = Field(..., min_length=1)
     key_points: list[str] = Field(..., min_length=3, max_length=3)
-    final_answer: str = Field(..., min_length=1, description="Короткий полезный ответ")
+    final_answer: str = Field(..., min_length=1)
+    prompt_used: str = Field(..., min_length=1)
 
-    @field_validator("summary", "final_answer")
+    @field_validator("intent", "summary", "final_answer", "prompt_used")
     @classmethod
     def strip_text(cls, value: str) -> str:
         value = value.strip()
