@@ -2,9 +2,10 @@ import json
 import os
 from typing import TypeVar
 
+import openai
 from dotenv import load_dotenv
 from openai import OpenAI
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, ValidationError
 
 from prompts import (
     CLASSIFY_SYSTEM_PROMPT,
@@ -13,7 +14,7 @@ from prompts import (
     build_response_user_prompt,
 )
 from router import get_style_instructions, route
-from schemas import ClassificationResult, RequestType, RoutedAnswer
+from schemas import ClassificationResult, RequestType, RoutedAnswer, StructuredAnswer
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -21,32 +22,12 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 T = TypeVar("T", bound=BaseModel)
 
 
-class StructuredOutputError(Exception):
-    """Понятная ошибка, если JSON от модели сломан или не проходит схему."""
+class PipelineError(Exception):
+    """Ошибка пайплайна: API, сеть, пустой ответ или сломанный JSON/схема."""
 
 
-class ResponseBody(BaseModel):
-    summary: str = Field(..., min_length=1)
-    key_points: list[str] = Field(..., min_length=3, max_length=3)
-    final_answer: str = Field(..., min_length=1)
-
-    @field_validator("summary", "final_answer")
-    @classmethod
-    def strip_text(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("поле не должно быть пустым")
-        return value
-
-    @field_validator("key_points")
-    @classmethod
-    def validate_key_points(cls, value: list[str]) -> list[str]:
-        cleaned = [item.strip() for item in value]
-        if any(not item for item in cleaned):
-            raise ValueError("каждый key point должен быть непустой строкой")
-        if len(cleaned) != 3:
-            raise ValueError("нужно ровно 3 key points")
-        return cleaned
+class StructuredOutputError(PipelineError):
+    """JSON от модели сломан или не проходит схему."""
 
 
 def _parse_json_response(raw: str | None, model: type[T]) -> T:
@@ -78,18 +59,44 @@ def _parse_json_response(raw: str | None, model: type[T]) -> T:
         ) from exc
 
 
-def _chat_json(system: str, user: str) -> str | None:
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.3,
-        max_tokens=1200,
-        response_format={"type": "json_object"},
-    )
-    return response.choices[0].message.content
+def _chat_json(system: str, user: str) -> str:
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.3,
+            max_tokens=1200,
+            response_format={"type": "json_object"},
+        )
+    except openai.AuthenticationError as exc:
+        raise PipelineError(
+            "Ошибка API: неверный или отсутствующий OPENAI_API_KEY."
+        ) from exc
+    except openai.RateLimitError as exc:
+        raise PipelineError(
+            "Ошибка API: превышен rate limit или квота. Попробуйте позже."
+        ) from exc
+    except openai.APIConnectionError as exc:
+        raise PipelineError(
+            f"Ошибка API: нет соединения с OpenAI ({exc})."
+        ) from exc
+    except openai.APIStatusError as exc:
+        raise PipelineError(
+            f"Ошибка API: HTTP {exc.status_code} — {exc.message}"
+        ) from exc
+    except openai.APIError as exc:
+        raise PipelineError(f"Ошибка API OpenAI: {exc}") from exc
+
+    if not response.choices:
+        raise PipelineError("Ошибка модели: пустой список choices в ответе API.")
+
+    content = response.choices[0].message.content
+    if content is None:
+        raise PipelineError("Ошибка модели: content в ответе равен null.")
+    return content
 
 
 def classify(text: str) -> ClassificationResult:
@@ -102,7 +109,6 @@ def generate_routed_answer(
     classification: ClassificationResult,
     category: RequestType | None = None,
 ) -> RoutedAnswer:
-    """Генерирует ответ с промптом, выбранным роутером по категории."""
     selected = category or classification.category
     prompt_key = route(selected)
     style_instructions = get_style_instructions(selected)
@@ -116,12 +122,20 @@ def generate_routed_answer(
             style_instructions=style_instructions,
         ),
     )
-    body = _parse_json_response(raw, ResponseBody)
+    body = _parse_json_response(raw, StructuredAnswer)
+
+    if body.category != selected:
+        raise StructuredOutputError(
+            f"category в structured output ({body.category.value}) "
+            f"не совпадает с routed category ({selected.value})."
+        )
+
     return RoutedAnswer(
-        category=selected,
-        intent=classification.intent,
         summary=body.summary,
+        category=body.category,
+        sentiment=body.sentiment,
         key_points=body.key_points,
         final_answer=body.final_answer,
+        intent=classification.intent,
         prompt_used=prompt_key,
     )

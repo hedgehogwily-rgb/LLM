@@ -1,7 +1,8 @@
-from schemas import RequestType
+from schemas import FINAL_ANSWER_MAX_SENTENCES, RequestType, SUMMARY_MAX_WORDS
 
 KEY_POINTS_COUNT = 3
 REQUEST_TYPES = " | ".join(item.value for item in RequestType)
+SENTIMENTS = "positive | neutral | negative"
 
 CLASSIFY_SYSTEM_PROMPT = (
     "You are a request classifier for a customer-facing assistant. "
@@ -30,7 +31,10 @@ CLASSIFY_USER_TEMPLATE = (
 RESPONSE_SYSTEM_BASE = (
     "You are a helpful assistant. "
     "Always reply with valid JSON only and no markdown. "
-    "Use the same language as the input text for summary, key_points and final_answer. "
+    "Critical: summary, key_points and final_answer MUST be written in the same language "
+    "as the input text (if the input is Russian, answer in Russian; if English, in English). "
+    "Never switch language. "
+    "category and sentiment must be English enum values. "
     "Do not add extra fields."
 )
 
@@ -47,7 +51,9 @@ RESPONSE_PROMPTS: dict[RequestType, str] = {
     ),
     RequestType.support: (
         "Style: structured technical support. "
-        "Give a clear numbered troubleshooting path (2–3 steps) and ask for missing diagnostic details if needed."
+        "Give a clear numbered troubleshooting path of exactly 3 short steps. "
+        "Keep the whole final_answer within 4 sentences. "
+        "Ask for missing diagnostic details only inside those steps, not as an extra paragraph."
     ),
     RequestType.feedback: (
         "Style: grateful feedback handling. "
@@ -66,14 +72,19 @@ RESPONSE_USER_TEMPLATE = (
     "Return ONLY this JSON schema:\n"
     "{{\n"
     '  "summary": string,\n'
+    f'  "category": "{REQUEST_TYPES}",\n'
+    f'  "sentiment": "{SENTIMENTS}",\n'
     '  "key_points": [string, string, string],\n'
     '  "final_answer": string\n'
     "}}\n\n"
-    f"Constraints:\n"
-    f"1) key_points length must be exactly {KEY_POINTS_COUNT}\n"
-    "2) summary is short\n"
-    "3) final_answer must clearly follow the style instructions\n"
-    "4) no extra keys, no markdown\n\n"
+    "Constraints:\n"
+    f"1) category MUST be exactly \"{{category}}\"\n"
+    f"2) summary <= {SUMMARY_MAX_WORDS} words\n"
+    f"3) key_points length must be exactly {KEY_POINTS_COUNT}\n"
+    f"4) final_answer <= {FINAL_ANSWER_MAX_SENTENCES} sentences\n"
+    "5) final_answer must clearly follow the style instructions\n"
+    "6) summary, key_points, final_answer language = input text language\n"
+    "7) no extra keys, no markdown\n\n"
     "Text:\n{text}"
 )
 

@@ -36,6 +36,8 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
+old_tz.md
+
 # Unit test / coverage reports
 htmlcov/
 .tox/
