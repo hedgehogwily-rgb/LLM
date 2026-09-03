@@ -89,6 +89,95 @@ RESPONSE_USER_TEMPLATE = (
 )
 
 
+EXTRACT_MEANING_SYSTEM = (
+    "You are a text analyst. Extract the core meaning, language, tone, and key entities "
+    "from the input text. Reply with valid JSON only, no markdown."
+)
+
+EXTRACT_MEANING_USER_TEMPLATE = (
+    "Analyze the following text and return ONLY this JSON schema:\n"
+    "{{\n"
+    '  "core_meaning": string (1-2 sentences, same language as text),\n'
+    '  "language": string (e.g. "ru", "en"),\n'
+    '  "tone": string (formal | informal | angry | grateful | neutral),\n'
+    '  "key_entities": [string, ...] (names, products, companies mentioned)\n'
+    "}}\n\n"
+    "Text:\n{text}"
+)
+
+BUILD_FIELDS_SYSTEM = (
+    "You are a structured data builder. "
+    "Using the provided meaning analysis and classification, build structured output fields. "
+    "Reply with valid JSON only, no markdown. "
+    "summary, key_points MUST be in the same language as the original text."
+)
+
+BUILD_FIELDS_USER_TEMPLATE = (
+    "Original text:\n{text}\n\n"
+    "Meaning analysis:\n{meaning}\n\n"
+    "Classification:\n  category: {category}\n  intent: {intent}\n\n"
+    "Return ONLY this JSON schema:\n"
+    "{{\n"
+    '  "summary": string,\n'
+    f'  "category": "{REQUEST_TYPES}",\n'
+    f'  "sentiment": "{SENTIMENTS}",\n'
+    '  "key_points": [string, string, string]\n'
+    "}}\n\n"
+    "Constraints:\n"
+    f"1) summary <= {SUMMARY_MAX_WORDS} words\n"
+    f"2) key_points must be exactly {KEY_POINTS_COUNT} items\n"
+    "3) category MUST be exactly \"{category}\"\n"
+    "4) language of summary and key_points = language of original text\n"
+)
+
+SELF_CHECK_SYSTEM = (
+    "You are a quality-assurance reviewer. Compare the original text with the generated "
+    "response and check for consistency and completeness. Reply with valid JSON only."
+)
+
+SELF_CHECK_USER_TEMPLATE = (
+    "Original text:\n{text}\n\n"
+    "Generated response:\n"
+    "  summary: {summary}\n"
+    "  category: {category}\n"
+    "  sentiment: {sentiment}\n"
+    "  key_points: {key_points}\n"
+    "  final_answer: {final_answer}\n\n"
+    "Check:\n"
+    "1. Does the response contradict the original text?\n"
+    "2. Are important details from the original text missing?\n\n"
+    "Return ONLY this JSON:\n"
+    "{{\n"
+    '  "is_consistent": boolean,\n'
+    '  "details_preserved": boolean,\n'
+    '  "issues": [string, ...] (empty list if all good),\n'
+    '  "verdict": string ("pass" or "fail: <reason>")\n'
+    "}}"
+)
+
+
+def build_extract_meaning_prompt(text: str) -> str:
+    return EXTRACT_MEANING_USER_TEMPLATE.format(text=text)
+
+
+def build_fields_prompt(
+    text: str, meaning: str, category: str, intent: str,
+) -> str:
+    return BUILD_FIELDS_USER_TEMPLATE.format(
+        text=text, meaning=meaning, category=category, intent=intent,
+    )
+
+
+def build_self_check_prompt(
+    text: str, summary: str, category: str, sentiment: str,
+    key_points: str, final_answer: str,
+) -> str:
+    return SELF_CHECK_USER_TEMPLATE.format(
+        text=text, summary=summary, category=category,
+        sentiment=sentiment, key_points=key_points, final_answer=final_answer,
+    )
+
+
 def build_classify_user_prompt(text: str) -> str:
     return CLASSIFY_USER_TEMPLATE.format(text=text)
 

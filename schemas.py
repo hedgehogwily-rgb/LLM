@@ -105,3 +105,61 @@ class RoutedAnswer(StructuredAnswer):
         if not value:
             raise ValueError("поле не должно быть пустым")
         return value
+
+
+class MeaningResult(BaseModel):
+    core_meaning: str = Field(..., min_length=1, description="Основная суть текста в 1-2 предложениях")
+    language: str = Field(..., min_length=1, description="Язык текста (ru/en/...)")
+    tone: str = Field(..., min_length=1, description="Тон текста: formal/informal/angry/grateful/neutral")
+    key_entities: list[str] = Field(default_factory=list, description="Упомянутые сущности: имена, продукты, компании")
+
+
+class FieldsResult(BaseModel):
+    summary: str = Field(..., min_length=1)
+    category: RequestType
+    sentiment: Sentiment
+    key_points: list[str] = Field(..., min_length=3, max_length=3)
+
+    @field_validator("summary")
+    @classmethod
+    def validate_fields_summary(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("summary не должен быть пустым")
+        words = count_words(value)
+        if words > SUMMARY_MAX_WORDS:
+            raise ValueError(f"summary: {words} слов, максимум {SUMMARY_MAX_WORDS}")
+        return value
+
+    @field_validator("key_points")
+    @classmethod
+    def validate_fields_key_points(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value]
+        if any(not item for item in cleaned):
+            raise ValueError("каждый key point должен быть непустой строкой")
+        if len(cleaned) != 3:
+            raise ValueError("нужно ровно 3 key points")
+        return cleaned
+
+
+class SelfCheckResult(BaseModel):
+    is_consistent: bool = Field(..., description="Не противоречит ли ответ исходному тексту")
+    details_preserved: bool = Field(..., description="Не потеряны ли важные детали")
+    issues: list[str] = Field(default_factory=list, description="Список найденных проблем (пустой если всё ок)")
+    verdict: str = Field(..., min_length=1, description="pass или fail с кратким пояснением")
+
+
+class ChainStepLog(BaseModel):
+    step: int
+    name: str
+    input_summary: str = ""
+    output_summary: str = ""
+
+
+class ChainResult(BaseModel):
+    meaning: MeaningResult
+    classification: ClassificationResult
+    fields: FieldsResult
+    answer: RoutedAnswer
+    self_check: SelfCheckResult
+    steps_log: list[ChainStepLog] = Field(default_factory=list)

@@ -8,18 +8,35 @@ from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 from prompts import (
+    BUILD_FIELDS_SYSTEM,
     CLASSIFY_SYSTEM_PROMPT,
+    EXTRACT_MEANING_SYSTEM,
     RESPONSE_SYSTEM_BASE,
+    SELF_CHECK_SYSTEM,
     build_classify_user_prompt,
+    build_extract_meaning_prompt,
+    build_fields_prompt,
     build_response_user_prompt,
+    build_self_check_prompt,
 )
 from router import get_style_instructions, route
-from schemas import ClassificationResult, RequestType, RoutedAnswer, StructuredAnswer
+from schemas import (
+    ChainResult,
+    ChainStepLog,
+    ClassificationResult,
+    FieldsResult,
+    MeaningResult,
+    RequestType,
+    RoutedAnswer,
+    SelfCheckResult,
+    StructuredAnswer,
+)
 
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 T = TypeVar("T", bound=BaseModel)
+
+_client: OpenAI | None = None
 
 
 class PipelineError(Exception):
@@ -28,6 +45,20 @@ class PipelineError(Exception):
 
 class StructuredOutputError(PipelineError):
     """JSON от модели сломан или не проходит схему."""
+
+
+def _get_client() -> OpenAI:
+    global _client
+    if _client is not None:
+        return _client
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key or not api_key.strip():
+        raise PipelineError(
+            "OPENAI_API_KEY не задан или пустой. "
+            "Добавьте его в .env или переменную окружения."
+        )
+    _client = OpenAI(api_key=api_key)
+    return _client
 
 
 def _parse_json_response(raw: str | None, model: type[T]) -> T:
@@ -61,7 +92,7 @@ def _parse_json_response(raw: str | None, model: type[T]) -> T:
 
 def _chat_json(system: str, user: str) -> str:
     try:
-        response = client.chat.completions.create(
+        response = _get_client().chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": system},
@@ -73,7 +104,7 @@ def _chat_json(system: str, user: str) -> str:
         )
     except openai.AuthenticationError as exc:
         raise PipelineError(
-            "Ошибка API: неверный или отсутствующий OPENAI_API_KEY."
+            "Ошибка API: неверный OPENAI_API_KEY."
         ) from exc
     except openai.RateLimitError as exc:
         raise PipelineError(
@@ -138,4 +169,108 @@ def generate_routed_answer(
         final_answer=body.final_answer,
         intent=classification.intent,
         prompt_used=prompt_key,
+    )
+
+
+# ─── Day 5: multi-step chain ───
+
+
+def extract_meaning(text: str) -> MeaningResult:
+    raw = _chat_json(EXTRACT_MEANING_SYSTEM, build_extract_meaning_prompt(text))
+    return _parse_json_response(raw, MeaningResult)
+
+
+def build_fields(
+    text: str,
+    meaning: MeaningResult,
+    classification: ClassificationResult,
+) -> FieldsResult:
+    raw = _chat_json(
+        BUILD_FIELDS_SYSTEM,
+        build_fields_prompt(
+            text=text,
+            meaning=meaning.core_meaning,
+            category=classification.category.value,
+            intent=classification.intent,
+        ),
+    )
+    return _parse_json_response(raw, FieldsResult)
+
+
+def self_check(text: str, answer: RoutedAnswer) -> SelfCheckResult:
+    raw = _chat_json(
+        SELF_CHECK_SYSTEM,
+        build_self_check_prompt(
+            text=text,
+            summary=answer.summary,
+            category=answer.category.value,
+            sentiment=answer.sentiment.value,
+            key_points=json.dumps(answer.key_points, ensure_ascii=False),
+            final_answer=answer.final_answer,
+        ),
+    )
+    return _parse_json_response(raw, SelfCheckResult)
+
+
+def run_chain(text: str) -> ChainResult:
+    steps: list[ChainStepLog] = []
+
+    # Шаг 1: extract meaning
+    meaning = extract_meaning(text)
+    steps.append(ChainStepLog(
+        step=1, name="extract_meaning",
+        input_summary=text[:80] + ("…" if len(text) > 80 else ""),
+        output_summary=meaning.core_meaning,
+    ))
+
+    # Шаг 2: classify (использует исходный текст)
+    classification = classify(text)
+    steps.append(ChainStepLog(
+        step=2, name="classify",
+        input_summary=text[:80] + ("…" if len(text) > 80 else ""),
+        output_summary=f"{classification.category.value} ({classification.confidence:.2f})",
+    ))
+
+    # Шаг 3: build structured fields (использует meaning + classification)
+    fields = build_fields(text, meaning, classification)
+    steps.append(ChainStepLog(
+        step=3, name="build_fields",
+        input_summary=f"meaning + {classification.category.value}",
+        output_summary=f"summary={fields.summary[:50]}…",
+    ))
+
+    # Шаг 4: generate final answer (использует classification + fields)
+    answer = generate_routed_answer(text, classification)
+    # Подменяем summary/key_points/sentiment из fields (шаг 3), чтобы цепочка
+    # была связной: answer опирается на то, что построил build_fields.
+    answer = RoutedAnswer(
+        summary=fields.summary,
+        category=fields.category,
+        sentiment=fields.sentiment,
+        key_points=fields.key_points,
+        final_answer=answer.final_answer,
+        intent=classification.intent,
+        prompt_used=answer.prompt_used,
+    )
+    steps.append(ChainStepLog(
+        step=4, name="generate_final_answer",
+        input_summary=f"category={classification.category.value}, intent={classification.intent}",
+        output_summary=answer.final_answer[:60] + "…",
+    ))
+
+    # Шаг 5: self-check (проверяет итоговый ответ против исходного текста)
+    check = self_check(text, answer)
+    steps.append(ChainStepLog(
+        step=5, name="self_check",
+        input_summary="original_text + final_answer",
+        output_summary=check.verdict,
+    ))
+
+    return ChainResult(
+        meaning=meaning,
+        classification=classification,
+        fields=fields,
+        answer=answer,
+        self_check=check,
+        steps_log=steps,
     )
