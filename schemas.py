@@ -142,6 +142,25 @@ class FieldsResult(BaseModel):
         return cleaned
 
 
+class FinalAnswerBody(BaseModel):
+    """Шаг 4: только final_answer — остальное уже построено на шаге 3."""
+    final_answer: str = Field(..., min_length=1)
+
+    @field_validator("final_answer")
+    @classmethod
+    def validate_final_answer(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("final_answer не должен быть пустым")
+        sentences = count_sentences(value)
+        if sentences > FINAL_ANSWER_MAX_SENTENCES:
+            raise ValueError(
+                f"final_answer слишком длинный: {sentences} предложений, "
+                f"максимум {FINAL_ANSWER_MAX_SENTENCES}"
+            )
+        return value
+
+
 class SelfCheckResult(BaseModel):
     is_consistent: bool = Field(..., description="Не противоречит ли ответ исходному тексту")
     details_preserved: bool = Field(..., description="Не потеряны ли важные детали")

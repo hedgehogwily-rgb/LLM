@@ -6,6 +6,8 @@ SENTIMENTS = "positive | neutral | negative"
 
 CLASSIFY_SYSTEM_PROMPT = (
     "You are a request classifier for a customer-facing assistant. "
+    "Use the meaning analysis from the previous pipeline step as the primary signal, "
+    "and the original text as supporting context. "
     "Reply with valid JSON only and no markdown. "
     "Pick exactly one category from the allowed enum. "
     "intent must be a short phrase in the same language as the input text. "
@@ -13,7 +15,8 @@ CLASSIFY_SYSTEM_PROMPT = (
 )
 
 CLASSIFY_USER_TEMPLATE = (
-    "Classify the user request and return ONLY this JSON schema:\n"
+    "Classify the user request using the meaning analysis from the previous step.\n"
+    "Return ONLY this JSON schema:\n"
     "{{\n"
     f'  "category": "{REQUEST_TYPES}",\n'
     '  "intent": string,\n'
@@ -25,7 +28,12 @@ CLASSIFY_USER_TEMPLATE = (
     "- complaint: dissatisfaction, anger, service failure\n"
     "- sales: buying, pricing, plans, upgrades\n"
     "- general_question: informational question without clear sales/support intent\n\n"
-    "Text:\n{text}"
+    "Meaning analysis (from previous step):\n"
+    "  core_meaning: {core_meaning}\n"
+    "  language: {language}\n"
+    "  tone: {tone}\n"
+    "  key_entities: {key_entities}\n\n"
+    "Original text:\n{text}"
 )
 
 RESPONSE_SYSTEM_BASE = (
@@ -65,6 +73,45 @@ RESPONSE_PROMPTS: dict[RequestType, str] = {
     ),
 }
 
+# Шаг 4: генерирует только final_answer, опираясь на результаты предыдущих шагов.
+FINAL_ANSWER_SYSTEM = (
+    "You are a helpful assistant. "
+    "Always reply with valid JSON only and no markdown. "
+    "You receive structured fields from previous pipeline steps. "
+    "Generate ONLY final_answer — do not reinvent summary, category, sentiment or key_points. "
+    "final_answer MUST be written in the same language as the original text. "
+    "Do not add extra fields."
+)
+
+FINAL_ANSWER_USER_TEMPLATE = (
+    "Use ALL previous-step results below to write the final answer.\n\n"
+    "Meaning (step 1):\n"
+    "  core_meaning: {core_meaning}\n"
+    "  language: {language}\n"
+    "  tone: {tone}\n"
+    "  key_entities: {key_entities}\n\n"
+    "Classification (step 2):\n"
+    "  category: {category}\n"
+    "  intent: {intent}\n\n"
+    "Structured fields (step 3):\n"
+    "  summary: {summary}\n"
+    "  sentiment: {sentiment}\n"
+    "  key_points: {key_points}\n\n"
+    "Style instructions (from router):\n{style_instructions}\n\n"
+    "Return ONLY this JSON schema:\n"
+    "{{\n"
+    '  "final_answer": string\n'
+    "}}\n\n"
+    "Constraints:\n"
+    f"1) final_answer <= {FINAL_ANSWER_MAX_SENTENCES} sentences\n"
+    "2) final_answer must follow the style instructions\n"
+    "3) final_answer must be consistent with summary, key_points and intent\n"
+    "4) language of final_answer = language of original text\n"
+    "5) no extra keys, no markdown\n\n"
+    "Original text:\n{text}"
+)
+
+# Legacy template (day 4 standalone generate) — kept for generate_routed_answer.
 RESPONSE_USER_TEMPLATE = (
     "Category: {category}\n"
     "Intent: {intent}\n"
@@ -178,8 +225,48 @@ def build_self_check_prompt(
     )
 
 
-def build_classify_user_prompt(text: str) -> str:
-    return CLASSIFY_USER_TEMPLATE.format(text=text)
+def build_classify_user_prompt(
+    text: str,
+    core_meaning: str,
+    language: str,
+    tone: str,
+    key_entities: str,
+) -> str:
+    return CLASSIFY_USER_TEMPLATE.format(
+        text=text,
+        core_meaning=core_meaning,
+        language=language,
+        tone=tone,
+        key_entities=key_entities,
+    )
+
+
+def build_final_answer_prompt(
+    text: str,
+    core_meaning: str,
+    language: str,
+    tone: str,
+    key_entities: str,
+    category: str,
+    intent: str,
+    summary: str,
+    sentiment: str,
+    key_points: str,
+    style_instructions: str,
+) -> str:
+    return FINAL_ANSWER_USER_TEMPLATE.format(
+        text=text,
+        core_meaning=core_meaning,
+        language=language,
+        tone=tone,
+        key_entities=key_entities,
+        category=category,
+        intent=intent,
+        summary=summary,
+        sentiment=sentiment,
+        key_points=key_points,
+        style_instructions=style_instructions,
+    )
 
 
 def build_response_user_prompt(

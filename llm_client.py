@@ -11,11 +11,13 @@ from prompts import (
     BUILD_FIELDS_SYSTEM,
     CLASSIFY_SYSTEM_PROMPT,
     EXTRACT_MEANING_SYSTEM,
+    FINAL_ANSWER_SYSTEM,
     RESPONSE_SYSTEM_BASE,
     SELF_CHECK_SYSTEM,
     build_classify_user_prompt,
     build_extract_meaning_prompt,
     build_fields_prompt,
+    build_final_answer_prompt,
     build_response_user_prompt,
     build_self_check_prompt,
 )
@@ -25,6 +27,7 @@ from schemas import (
     ChainStepLog,
     ClassificationResult,
     FieldsResult,
+    FinalAnswerBody,
     MeaningResult,
     RequestType,
     RoutedAnswer,
@@ -130,8 +133,18 @@ def _chat_json(system: str, user: str) -> str:
     return content
 
 
-def classify(text: str) -> ClassificationResult:
-    raw = _chat_json(CLASSIFY_SYSTEM_PROMPT, build_classify_user_prompt(text))
+def classify(text: str, meaning: MeaningResult) -> ClassificationResult:
+    """Шаг 2: классификация на основе meaning из шага 1."""
+    raw = _chat_json(
+        CLASSIFY_SYSTEM_PROMPT,
+        build_classify_user_prompt(
+            text=text,
+            core_meaning=meaning.core_meaning,
+            language=meaning.language,
+            tone=meaning.tone,
+            key_entities=json.dumps(meaning.key_entities, ensure_ascii=False),
+        ),
+    )
     return _parse_json_response(raw, ClassificationResult)
 
 
@@ -140,6 +153,7 @@ def generate_routed_answer(
     classification: ClassificationResult,
     category: RequestType | None = None,
 ) -> RoutedAnswer:
+    """Day 4 standalone: один вызов без цепочки (smoke/legacy)."""
     selected = category or classification.category
     prompt_key = route(selected)
     style_instructions = get_style_instructions(selected)
@@ -194,7 +208,54 @@ def build_fields(
             intent=classification.intent,
         ),
     )
-    return _parse_json_response(raw, FieldsResult)
+    fields = _parse_json_response(raw, FieldsResult)
+
+    if fields.category != classification.category:
+        raise StructuredOutputError(
+            f"fields.category ({fields.category.value}) не совпадает с "
+            f"classification.category ({classification.category.value})."
+        )
+    return fields
+
+
+def generate_final_answer(
+    text: str,
+    meaning: MeaningResult,
+    classification: ClassificationResult,
+    fields: FieldsResult,
+) -> RoutedAnswer:
+    """Шаг 4: final_answer строится из meaning + classification + fields."""
+    selected = classification.category
+    prompt_key = route(selected)
+    style_instructions = get_style_instructions(selected)
+
+    raw = _chat_json(
+        FINAL_ANSWER_SYSTEM,
+        build_final_answer_prompt(
+            text=text,
+            core_meaning=meaning.core_meaning,
+            language=meaning.language,
+            tone=meaning.tone,
+            key_entities=json.dumps(meaning.key_entities, ensure_ascii=False),
+            category=selected.value,
+            intent=classification.intent,
+            summary=fields.summary,
+            sentiment=fields.sentiment.value,
+            key_points=json.dumps(fields.key_points, ensure_ascii=False),
+            style_instructions=style_instructions,
+        ),
+    )
+    body = _parse_json_response(raw, FinalAnswerBody)
+
+    return RoutedAnswer(
+        summary=fields.summary,
+        category=fields.category,
+        sentiment=fields.sentiment,
+        key_points=fields.key_points,
+        final_answer=body.final_answer,
+        intent=classification.intent,
+        prompt_used=prompt_key,
+    )
 
 
 def self_check(text: str, answer: RoutedAnswer) -> SelfCheckResult:
@@ -213,6 +274,7 @@ def self_check(text: str, answer: RoutedAnswer) -> SelfCheckResult:
 
 
 def run_chain(text: str) -> ChainResult:
+    """5-шаговая цепочка: каждый шаг использует результат предыдущего."""
     steps: list[ChainStepLog] = []
 
     # Шаг 1: extract meaning
@@ -223,15 +285,15 @@ def run_chain(text: str) -> ChainResult:
         output_summary=meaning.core_meaning,
     ))
 
-    # Шаг 2: classify (использует исходный текст)
-    classification = classify(text)
+    # Шаг 2: classify — использует meaning из шага 1
+    classification = classify(text, meaning)
     steps.append(ChainStepLog(
         step=2, name="classify",
-        input_summary=text[:80] + ("…" if len(text) > 80 else ""),
+        input_summary=f"meaning: {meaning.core_meaning[:60]}…",
         output_summary=f"{classification.category.value} ({classification.confidence:.2f})",
     ))
 
-    # Шаг 3: build structured fields (использует meaning + classification)
+    # Шаг 3: build fields — использует meaning + classification
     fields = build_fields(text, meaning, classification)
     steps.append(ChainStepLog(
         step=3, name="build_fields",
@@ -239,30 +301,21 @@ def run_chain(text: str) -> ChainResult:
         output_summary=f"summary={fields.summary[:50]}…",
     ))
 
-    # Шаг 4: generate final answer (использует classification + fields)
-    answer = generate_routed_answer(text, classification)
-    # Подменяем summary/key_points/sentiment из fields (шаг 3), чтобы цепочка
-    # была связной: answer опирается на то, что построил build_fields.
-    answer = RoutedAnswer(
-        summary=fields.summary,
-        category=fields.category,
-        sentiment=fields.sentiment,
-        key_points=fields.key_points,
-        final_answer=answer.final_answer,
-        intent=classification.intent,
-        prompt_used=answer.prompt_used,
-    )
+    # Шаг 4: final_answer — использует meaning + classification + fields
+    answer = generate_final_answer(text, meaning, classification, fields)
     steps.append(ChainStepLog(
         step=4, name="generate_final_answer",
-        input_summary=f"category={classification.category.value}, intent={classification.intent}",
+        input_summary=(
+            f"fields.summary + fields.key_points + {classification.category.value}"
+        ),
         output_summary=answer.final_answer[:60] + "…",
     ))
 
-    # Шаг 5: self-check (проверяет итоговый ответ против исходного текста)
+    # Шаг 5: self-check — использует итоговый answer
     check = self_check(text, answer)
     steps.append(ChainStepLog(
         step=5, name="self_check",
-        input_summary="original_text + final_answer",
+        input_summary="original_text + answer from steps 1–4",
         output_summary=check.verdict,
     ))
 
