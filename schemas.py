@@ -182,3 +182,6 @@ class ChainResult(BaseModel):
     answer: RoutedAnswer
     self_check: SelfCheckResult
     steps_log: list[ChainStepLog] = Field(default_factory=list)
+    fallback_used: bool = False
+    degraded: bool = False
+    errors: list[str] = Field(default_factory=list)

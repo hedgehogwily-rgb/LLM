@@ -281,3 +281,83 @@ def build_response_user_prompt(
         intent=intent,
         style_instructions=style_instructions,
     )
+
+
+# ─── Day 6: compact fallback prompts ───
+
+FALLBACK_SYSTEM = (
+    "Return valid JSON only. No markdown. No extra keys. "
+    "Follow the schema exactly."
+)
+
+EXTRACT_MEANING_FALLBACK_USER = (
+    "Return ONLY:\n"
+    '{{"core_meaning": string, "language": string, "tone": string, "key_entities": []}}\n'
+    "Text:\n{text}"
+)
+
+CLASSIFY_FALLBACK_USER = (
+    "Return ONLY:\n"
+    "{{\n"
+    f'  "category": "{REQUEST_TYPES}",\n'
+    '  "intent": string,\n'
+    '  "confidence": number\n'
+    "}}\n"
+    "Meaning: {core_meaning}\n"
+    "Text:\n{text}"
+)
+
+BUILD_FIELDS_FALLBACK_USER = (
+    "Return ONLY:\n"
+    "{{\n"
+    '  "summary": string,\n'
+    f'  "category": "{REQUEST_TYPES}",\n'
+    f'  "sentiment": "{SENTIMENTS}",\n'
+    '  "key_points": [string, string, string]\n'
+    "}}\n"
+    f"summary <= {SUMMARY_MAX_WORDS} words, exactly 3 key_points, "
+    'category MUST be "{category}".\n'
+    "Meaning: {meaning}\nIntent: {intent}\nText:\n{text}"
+)
+
+FINAL_ANSWER_FALLBACK_USER = (
+    'Return ONLY: {{"final_answer": string}}\n'
+    f"Max {FINAL_ANSWER_MAX_SENTENCES} sentences. Same language as text.\n"
+    "Summary: {summary}\nKey points: {key_points}\nIntent: {intent}\n"
+    "Text:\n{text}"
+)
+
+SELF_CHECK_FALLBACK_USER = (
+    "Return ONLY:\n"
+    '{{"is_consistent": boolean, "details_preserved": boolean, '
+    '"issues": [], "verdict": string}}\n'
+    "Original: {text}\nAnswer: {final_answer}"
+)
+
+
+def build_extract_meaning_fallback_prompt(text: str) -> str:
+    return EXTRACT_MEANING_FALLBACK_USER.format(text=text)
+
+
+def build_classify_fallback_prompt(text: str, core_meaning: str) -> str:
+    return CLASSIFY_FALLBACK_USER.format(text=text, core_meaning=core_meaning)
+
+
+def build_fields_fallback_prompt(
+    text: str, meaning: str, category: str, intent: str,
+) -> str:
+    return BUILD_FIELDS_FALLBACK_USER.format(
+        text=text, meaning=meaning, category=category, intent=intent,
+    )
+
+
+def build_final_answer_fallback_prompt(
+    text: str, summary: str, key_points: str, intent: str,
+) -> str:
+    return FINAL_ANSWER_FALLBACK_USER.format(
+        text=text, summary=summary, key_points=key_points, intent=intent,
+    )
+
+
+def build_self_check_fallback_prompt(text: str, final_answer: str) -> str:
+    return SELF_CHECK_FALLBACK_USER.format(text=text, final_answer=final_answer)
