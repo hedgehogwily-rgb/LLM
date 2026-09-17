@@ -14,10 +14,20 @@ from llm_client import (
     StructuredOutputError,
     _chat_json,
     _chat_json_validated,
+    _degraded_answer,
     _parse_json_response,
+    _safe_degraded_final_answer,
     run_chain,
 )
-from schemas import MeaningResult
+from schemas import (
+    FINAL_ANSWER_MAX_SENTENCES,
+    ClassificationResult,
+    FieldsResult,
+    MeaningResult,
+    RequestType,
+    Sentiment,
+    count_sentences,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -174,6 +184,31 @@ class GuardrailsTests(unittest.TestCase):
     def test_parse_rejects_plain_text(self) -> None:
         with self.assertRaises(StructuredOutputError):
             _parse_json_response("это не json", MeaningResult)
+
+    def test_degraded_answer_respects_sentence_limit(self) -> None:
+        summary = "Один. Два. Три. Четыре."
+        fields = FieldsResult(
+            summary=summary,
+            category=RequestType.complaint,
+            sentiment=Sentiment.negative,
+            key_points=["a", "b", "c"],
+        )
+        classification = ClassificationResult(
+            category=RequestType.complaint,
+            intent="тест",
+            confidence=0.0,
+        )
+
+        answer = _degraded_answer(classification, fields)
+
+        self.assertLessEqual(
+            count_sentences(answer.final_answer),
+            FINAL_ANSWER_MAX_SENTENCES,
+        )
+        self.assertTrue(answer.final_answer.startswith("Не удалось"))
+        safe = _safe_degraded_final_answer(summary)
+        self.assertLessEqual(count_sentences(safe), FINAL_ANSWER_MAX_SENTENCES)
+        self.assertEqual(answer.final_answer, safe)
 
 
 if __name__ == "__main__":

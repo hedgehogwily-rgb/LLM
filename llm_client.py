@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 from typing import TypeVar
 
@@ -31,6 +32,7 @@ from prompts import (
 )
 from router import get_style_instructions, route
 from schemas import (
+    FINAL_ANSWER_MAX_SENTENCES,
     SUMMARY_MAX_WORDS,
     ChainResult,
     ChainStepLog,
@@ -43,6 +45,7 @@ from schemas import (
     SelfCheckResult,
     Sentiment,
     StructuredAnswer,
+    count_sentences,
 )
 
 load_dotenv()
@@ -402,6 +405,34 @@ def _truncate_summary(text: str) -> str:
     return " ".join(words[:SUMMARY_MAX_WORDS])
 
 
+def _split_sentences(text: str) -> list[str]:
+    normalized = re.sub(r"(?<=\d)\.(?=\s)", " ", text.strip())
+    return [p.strip() for p in re.split(r"[.!?…]+", normalized) if p.strip()]
+
+
+def _join_sentences(parts: list[str]) -> str:
+    if not parts:
+        return "Не удалось сгенерировать полный ответ."
+    return ". ".join(parts).rstrip(".") + "."
+
+
+def _safe_degraded_final_answer(summary: str) -> str:
+    prefix = "Не удалось сгенерировать полный ответ"
+    budget = max(FINAL_ANSWER_MAX_SENTENCES - 1, 0)
+    summary_parts = _split_sentences(summary)[:budget]
+    if summary_parts:
+        candidate = _join_sentences([prefix, *summary_parts])
+    else:
+        candidate = prefix + "."
+
+    while count_sentences(candidate) > FINAL_ANSWER_MAX_SENTENCES:
+        parts = _split_sentences(candidate)
+        if len(parts) <= 1:
+            return prefix + "."
+        candidate = _join_sentences(parts[:-1])
+    return candidate
+
+
 def _degraded_meaning(text: str) -> MeaningResult:
     return MeaningResult(
         core_meaning=_truncate_summary(text)[:200] or "Смысл не извлечён.",
@@ -436,17 +467,31 @@ def _degraded_answer(
     classification: ClassificationResult,
     fields: FieldsResult,
 ) -> RoutedAnswer:
-    return RoutedAnswer(
-        summary=fields.summary,
-        category=fields.category,
-        sentiment=fields.sentiment,
-        key_points=fields.key_points,
-        final_answer=(
-            f"Не удалось сгенерировать полный ответ. Кратко: {fields.summary}"
-        ),
-        intent=classification.intent,
-        prompt_used=route(classification.category),
-    )
+    final_answer = _safe_degraded_final_answer(fields.summary)
+    try:
+        return RoutedAnswer(
+            summary=fields.summary,
+            category=fields.category,
+            sentiment=fields.sentiment,
+            key_points=fields.key_points,
+            final_answer=final_answer,
+            intent=classification.intent,
+            prompt_used=route(classification.category),
+        )
+    except ValidationError:
+        logger.error(
+            "degraded RoutedAnswer не прошёл валидацию; "
+            "возвращаем минимальный stub"
+        )
+        return RoutedAnswer(
+            summary=_truncate_summary(fields.summary),
+            category=fields.category,
+            sentiment=fields.sentiment,
+            key_points=fields.key_points,
+            final_answer="Не удалось сгенерировать полный ответ.",
+            intent=(classification.intent or "degraded")[:200],
+            prompt_used=route(classification.category),
+        )
 
 
 def _degraded_self_check(errors: list[str]) -> SelfCheckResult:
