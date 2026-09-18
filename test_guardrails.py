@@ -15,18 +15,22 @@ from llm_client import (
     _chat_json,
     _chat_json_validated,
     _degraded_answer,
+    _degraded_fields,
     _parse_json_response,
     _safe_degraded_final_answer,
+    _truncate_summary,
     run_chain,
 )
 from schemas import (
     FINAL_ANSWER_MAX_SENTENCES,
+    SUMMARY_MAX_WORDS,
     ClassificationResult,
     FieldsResult,
     MeaningResult,
     RequestType,
     Sentiment,
     count_sentences,
+    count_words,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -209,6 +213,28 @@ class GuardrailsTests(unittest.TestCase):
         safe = _safe_degraded_final_answer(summary)
         self.assertLessEqual(count_sentences(safe), FINAL_ANSWER_MAX_SENTENCES)
         self.assertEqual(answer.final_answer, safe)
+
+    def test_truncate_summary_matches_count_words_for_hyphens(self) -> None:
+        long_text = " ".join(["слово-слово"] * 20)
+        self.assertGreater(count_words(long_text), SUMMARY_MAX_WORDS)
+        self.assertEqual(len(long_text.split()), 20)
+
+        truncated = _truncate_summary(long_text)
+        self.assertLessEqual(count_words(truncated), SUMMARY_MAX_WORDS)
+
+        meaning = MeaningResult(
+            core_meaning=long_text,
+            language="ru",
+            tone="neutral",
+            key_entities=[],
+        )
+        classification = ClassificationResult(
+            category=RequestType.general_question,
+            intent="тест",
+            confidence=0.0,
+        )
+        fields = _degraded_fields(meaning, classification)
+        self.assertLessEqual(count_words(fields.summary), SUMMARY_MAX_WORDS)
 
 
 if __name__ == "__main__":

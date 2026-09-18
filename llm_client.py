@@ -46,6 +46,7 @@ from schemas import (
     Sentiment,
     StructuredAnswer,
     count_sentences,
+    count_words,
 )
 
 load_dotenv()
@@ -399,10 +400,17 @@ def self_check(text: str, answer: RoutedAnswer) -> tuple[SelfCheckResult, bool]:
 
 
 def _truncate_summary(text: str) -> str:
-    words = text.split()
-    if len(words) <= SUMMARY_MAX_WORDS:
-        return text.strip() or "Краткое содержание недоступно."
-    return " ".join(words[:SUMMARY_MAX_WORDS])
+    text = text.strip()
+    if not text:
+        return "Краткое содержание недоступно."
+    if count_words(text) <= SUMMARY_MAX_WORDS:
+        return text
+    matches = list(re.finditer(r"\w+", text, flags=re.UNICODE))
+    if len(matches) <= SUMMARY_MAX_WORDS:
+        return text
+    end = matches[SUMMARY_MAX_WORDS - 1].end()
+    truncated = text[:end].strip()
+    return truncated or "Краткое содержание недоступно."
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -454,13 +462,26 @@ def _degraded_fields(
     meaning: MeaningResult,
     classification: ClassificationResult,
 ) -> FieldsResult:
-    point = meaning.core_meaning or "детали недоступны"
-    return FieldsResult(
-        summary=_truncate_summary(meaning.core_meaning),
-        category=classification.category,
-        sentiment=Sentiment.neutral,
-        key_points=[point[:80], "Частичный результат (degraded)", "Повторная генерация не удалась"],
-    )
+    point = (meaning.core_meaning or "детали недоступны")[:80]
+    summary = _truncate_summary(meaning.core_meaning)
+    try:
+        return FieldsResult(
+            summary=summary,
+            category=classification.category,
+            sentiment=Sentiment.neutral,
+            key_points=[point, "Частичный результат (degraded)", "Повторная генерация не удалась"],
+        )
+    except ValidationError:
+        logger.error(
+            "degraded FieldsResult не прошёл валидацию; "
+            "возвращаем минимальный stub"
+        )
+        return FieldsResult(
+            summary="Краткое содержание недоступно.",
+            category=classification.category,
+            sentiment=Sentiment.neutral,
+            key_points=["degraded", "частичный результат", "повтор не удался"],
+        )
 
 
 def _degraded_answer(
