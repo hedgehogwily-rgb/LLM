@@ -1,3 +1,4 @@
+import argparse
 import json
 import logging
 import re
@@ -18,6 +19,36 @@ EXPECTED_PATTERN = re.compile(
     r"^(?P<label>support|feedback|complaint|sales|general)_.+\.txt$"
 )
 
+# Минимум 5 демо-сценариев разных категорий (см. demo/SCENARIOS.md).
+DEMO_SCENARIOS = [
+    "complaint_billing.txt",
+    "support_login.txt",
+    "sales_pricing.txt",
+    "feedback_ui.txt",
+    "general_temperature.txt",
+]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="LLM text pipeline mini-product",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--text", type=str, help="Обработать один текст")
+    group.add_argument("--file", type=Path, help="Обработать один .txt файл")
+    group.add_argument(
+        "--demo",
+        action="store_true",
+        help="Запустить 5 демо-сценариев из texts/",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("results.json"),
+        help="Путь для JSON-результата (по умолчанию results.json)",
+    )
+    return parser.parse_args()
+
 
 def expected_category_from_filename(filename: str) -> str | None:
     match = EXPECTED_PATTERN.match(filename)
@@ -32,6 +63,16 @@ def load_texts(directory: Path = TEXTS_DIR) -> list[tuple[str, str]]:
     if not paths:
         raise FileNotFoundError(f"Нет .txt файлов в {directory}")
     return [(path.name, path.read_text(encoding="utf-8").strip()) for path in paths]
+
+
+def load_demo_texts(directory: Path = TEXTS_DIR) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for name in DEMO_SCENARIOS:
+        path = directory / name
+        if not path.exists():
+            raise FileNotFoundError(f"Демо-файл не найден: {path}")
+        rows.append((name, path.read_text(encoding="utf-8").strip()))
+    return rows
 
 
 def log_chain_steps(chain: ChainResult) -> None:
@@ -77,9 +118,10 @@ def log_result(
 
     logger.info("--- Meaning ---")
     logger.info("  core: %s", chain.meaning.core_meaning)
-    logger.info("  tone: %s | lang: %s | entities: %s",
-                chain.meaning.tone, chain.meaning.language,
-                chain.meaning.key_entities)
+    logger.info(
+        "  tone: %s | lang: %s | entities: %s",
+        chain.meaning.tone, chain.meaning.language, chain.meaning.key_entities,
+    )
 
     logger.info("--- Fields ---")
     logger.info("  summary: %s", chain.fields.summary)
@@ -97,6 +139,47 @@ def log_result(
     if check.issues:
         for issue in check.issues:
             logger.info("  ⚠ %s", issue)
+
+
+def chain_to_row(
+    filename: str,
+    text: str,
+    expected: str | None,
+    chain: ChainResult,
+) -> dict:
+    return {
+        "file": filename,
+        "text": text,
+        "expected_category": expected,
+        "meaning": chain.meaning.model_dump(mode="json"),
+        "classification": chain.classification.model_dump(mode="json"),
+        "fields": chain.fields.model_dump(mode="json"),
+        "answer": chain.answer.model_dump(mode="json"),
+        "self_check": chain.self_check.model_dump(mode="json"),
+        "steps_log": [s.model_dump(mode="json") for s in chain.steps_log],
+        "fallback_used": chain.fallback_used,
+        "degraded": chain.degraded,
+        "errors": chain.errors,
+    }
+
+
+def process_one(name: str, text: str, index: int = 1) -> dict:
+    expected = expected_category_from_filename(name)
+    chain = run_chain(text)
+    log_result(index, name, expected, chain)
+    return chain_to_row(name, text, expected, chain)
+
+
+def process_batch(items: list[tuple[str, str]]) -> tuple[list[dict], list[dict]]:
+    results: list[dict] = []
+    errors: list[dict] = []
+    for i, (filename, text) in enumerate(items, start=1):
+        try:
+            results.append(process_one(filename, text, index=i))
+        except PipelineError as exc:
+            logger.error("Ошибка пайплайна для %s: %s", filename, exc)
+            errors.append({"file": filename, "error": str(exc)})
+    return results, errors
 
 
 def build_report(rows: list[dict]) -> dict:
@@ -148,54 +231,12 @@ def build_report(rows: list[dict]) -> dict:
     }
 
 
-def main() -> None:
-    texts = load_texts()
-    if len(texts) < 5:
-        raise ValueError("Нужно минимум 5 тестовых текстов в папке texts/")
-
-    results: list[dict] = []
-    errors: list[dict] = []
-
-    for i, (filename, text) in enumerate(texts, start=1):
-        expected = expected_category_from_filename(filename)
-        try:
-            chain = run_chain(text)
-            log_result(i, filename, expected, chain)
-            # Degraded тоже usable — кладём в results, не в hard-errors.
-            results.append({
-                "file": filename,
-                "text": text,
-                "expected_category": expected,
-                "meaning": chain.meaning.model_dump(mode="json"),
-                "classification": chain.classification.model_dump(mode="json"),
-                "fields": chain.fields.model_dump(mode="json"),
-                "answer": chain.answer.model_dump(mode="json"),
-                "self_check": chain.self_check.model_dump(mode="json"),
-                "steps_log": [s.model_dump(mode="json") for s in chain.steps_log],
-                "fallback_used": chain.fallback_used,
-                "degraded": chain.degraded,
-                "errors": chain.errors,
-            })
-        except PipelineError as exc:
-            # Hard-fail: не удалось собрать даже degraded (теоретически редко).
-            logger.error("Ошибка пайплайна для %s: %s", filename, exc)
-            errors.append({"file": filename, "error": str(exc)})
-
-    report = build_report(results)
-    logger.info("=" * 60)
-    logger.info("ИТОГОВЫЙ ОТЧЁТ")
-    logger.info("Успешно: %s | hard-ошибок: %s", report["total"], len(errors))
-    logger.info("Fallback: %s | Degraded: %s", report["fallback_count"], report["degraded_count"])
-    logger.info("По категориям: %s", report["by_category"])
-    logger.info("Тональность: %s", report["sentiment_counts"])
-    logger.info("Промпты: %s", report["prompt_usage"])
-    logger.info(
-        "Self-check: %s/%s passed",
-        report["self_check_passed"], report["self_check_total"],
-    )
-    logger.info("Accuracy классификации: %s", report["classification_accuracy"])
-
-    output_path = Path("results.json")
+def save_results(
+    results: list[dict],
+    errors: list[dict],
+    report: dict,
+    output_path: Path,
+) -> None:
     output_path.write_text(
         json.dumps(
             {"results": results, "errors": errors, "report": report},
@@ -205,6 +246,47 @@ def main() -> None:
         encoding="utf-8",
     )
     logger.info("Результаты сохранены в %s", output_path)
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.text is not None:
+        items = [("cli_text", args.text.strip())]
+        if not items[0][1]:
+            raise SystemExit("Передан пустой --text")
+    elif args.file is not None:
+        if not args.file.exists():
+            raise SystemExit(f"Файл не найден: {args.file}")
+        items = [(args.file.name, args.file.read_text(encoding="utf-8").strip())]
+    elif args.demo:
+        items = load_demo_texts()
+        logger.info("Demo: %s сценариев", len(items))
+    else:
+        items = load_texts()
+        if len(items) < 5:
+            raise ValueError("Нужно минимум 5 тестовых текстов в папке texts/")
+
+    results, errors = process_batch(items)
+    report = build_report(results)
+
+    logger.info("=" * 60)
+    logger.info("ИТОГОВЫЙ ОТЧЁТ")
+    logger.info("Успешно: %s | hard-ошибок: %s", report["total"], len(errors))
+    logger.info(
+        "Fallback: %s | Degraded: %s",
+        report["fallback_count"], report["degraded_count"],
+    )
+    logger.info("По категориям: %s", report["by_category"])
+    logger.info("Тональность: %s", report["sentiment_counts"])
+    logger.info("Промпты: %s", report["prompt_usage"])
+    logger.info(
+        "Self-check: %s/%s passed",
+        report["self_check_passed"], report["self_check_total"],
+    )
+    logger.info("Accuracy классификации: %s", report["classification_accuracy"])
+
+    save_results(results, errors, report, args.out)
 
     if errors and not results:
         raise SystemExit("Все примеры завершились ошибкой.")
